@@ -320,7 +320,7 @@ where
             .context("Storage provider not set")?
             .upload_program(program)
             .await
-            .map_err(|e| anyhow!("Failed to upload program: {e}"))?)
+            .map_err(|e| anyhow!("Failed to upload program: {e:?}"))?)
     }
 
     /// Upload input to the storage provider
@@ -331,7 +331,7 @@ where
             .context("Storage provider not set")?
             .upload_input(input)
             .await
-            .map_err(|e| anyhow!("Failed to upload input: {e}"))?)
+            .map_err(|e| anyhow!("Failed to upload input: {e:?}"))?)
     }
 
     /// Submit a proof request.
