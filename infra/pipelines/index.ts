@@ -6,13 +6,14 @@ import { SlasherPipeline } from "./pipelines/slasher";
 import { Notifications } from "./components/notifications";
 import { OrderGeneratorPipeline } from "./pipelines/order-generator";
 import { OrderStreamPipeline } from "./pipelines/order-stream";
+import { IndexerPipeline } from "./pipelines/indexer";
 import { CodePipelineSharedResources } from "./components/codePipelineResources";
 import * as aws from "@pulumi/aws";
-import { 
-  BOUNDLESS_DEV_ADMIN_ROLE_ARN, 
-  BOUNDLESS_OPS_ACCOUNT_ID, 
-  BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN, 
-  BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN, 
+import {
+  BOUNDLESS_DEV_ADMIN_ROLE_ARN,
+  BOUNDLESS_OPS_ACCOUNT_ID,
+  BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN,
+  BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN,
   BOUNDLESS_STAGING_ADMIN_ROLE_ARN,
   BOUNDLESS_PROD_ADMIN_ROLE_ARN,
   BOUNDLESS_STAGING_ACCOUNT_ID,
@@ -70,7 +71,11 @@ const codePipelineSharedResources = new CodePipelineSharedResources("codePipelin
 
 const config = new pulumi.Config();
 const boundlessAlertsSlackId = config.requireSecret("BOUNDLESS_ALERTS_SLACK_ID");
+const boundlessAlertsStagingSlackId = config.requireSecret("BOUNDLESS_ALERTS_STAGING_SLACK_ID");
 const workspaceSlackId = config.requireSecret("WORKSPACE_SLACK_ID");
+const pagerdutyIntegrationUrl = config.requireSecret("PAGERDUTY_INTEGRATION_URL");
+const ssoBaseUrl = config.require("SSO_BASE_URL");
+const runbookUrl = config.require("RUNBOOK_URL");
 
 const notifications = new Notifications("notifications", {
   opsAccountId: BOUNDLESS_OPS_ACCOUNT_ID,
@@ -79,8 +84,12 @@ const notifications = new Notifications("notifications", {
     BOUNDLESS_STAGING_ACCOUNT_ID,
     BOUNDLESS_PROD_ACCOUNT_ID,
   ],
-  slackChannelId: boundlessAlertsSlackId,
+  prodSlackChannelId: boundlessAlertsSlackId,
+  stagingSlackChannelId: boundlessAlertsStagingSlackId,
   slackTeamId: workspaceSlackId,
+  pagerdutyIntegrationUrl,
+  ssoBaseUrl,
+  runbookUrl,
 });
 
 // The Docker and GH tokens are used to avoid rate limiting issues when building in the pipelines.
@@ -135,6 +144,17 @@ const orderStreamPipeline = new OrderStreamPipeline("orderStreamPipeline", {
   slackAlertsTopicArn: notifications.slackSNSTopic.arn,
 })
 
+const indexerPipeline = new IndexerPipeline("indexerPipeline", {
+  connection: githubConnection,
+  artifactBucket: codePipelineSharedResources.artifactBucket,
+  role: codePipelineSharedResources.role,
+  githubToken,
+  dockerUsername,
+  dockerToken,
+  slackAlertsTopicArn: notifications.slackSNSTopic.arn,
+})
+
 export const bucketName = pulumiStateBucket.bucket.id;
 export const kmsKeyArn = pulumiSecrets.kmsKey.arn;
 export const boundlessAlertsTopicArn = notifications.slackSNSTopic.arn;
+export const boundlessPagerdutyTopicArn = notifications.pagerdutySNSTopic.arn;

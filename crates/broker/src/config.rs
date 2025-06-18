@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use notify::{EventKind, Watcher};
 use serde::{Deserialize, Serialize};
@@ -46,8 +46,25 @@ mod defaults {
         250_000
     }
 
+    pub const fn additional_proof_cycles() -> u64 {
+        // 2 mcycles for assessor + 270k cycles for set builder by default
+        2_000_000 + 270_000
+    }
+
     pub const fn max_submission_attempts() -> u32 {
-        3
+        2
+    }
+
+    pub const fn reaper_interval_secs() -> u32 {
+        60
+    }
+
+    pub const fn reaper_grace_period_secs() -> u32 {
+        10800
+    }
+
+    pub const fn max_concurrent_preflights() -> u32 {
+        4
     }
 }
 /// All configuration related to markets mechanics
@@ -74,6 +91,10 @@ pub struct MarketConf {
     ///
     /// Orders over this max_cycles will be skipped after preflight
     pub max_mcycle_limit: Option<u64>,
+    /// Optional allow list for addresses that can bypass the mcycle limit
+    ///
+    /// If enabled, all requests from clients in the allow list will be accepted regardless of the mcycle limit.
+    pub allow_skip_mcycle_limit_addresses: Option<Vec<Address>>,
     /// Max journal size in bytes
     ///
     /// Orders that produce a journal larger than this size in preflight will be skipped. Since journals
@@ -97,8 +118,6 @@ pub struct MarketConf {
     ///
     /// Requests that require a higher stake than this will not be considered.
     pub max_stake: String,
-    /// Optional list of image IDs for which preflight should be skipped.
-    pub skip_preflight_ids: Option<Vec<B256>>,
     /// Optional allow list for customer address.
     ///
     /// If enabled, all requests from clients not in the allow list are skipped.
@@ -131,6 +150,11 @@ pub struct MarketConf {
     /// conservative default will be used.
     #[serde(default = "defaults::groth16_verify_gas_estimate")]
     pub groth16_verify_gas_estimate: u64,
+    /// Additional cycles to be proven for each order.
+    ///
+    /// This is currently the sum of the cycles for the assessor and set builder.
+    #[serde(default = "defaults::additional_proof_cycles")]
+    pub additional_proof_cycles: u64,
     /// Optional balance warning threshold (in native token)
     ///
     /// If the submitter balance drops below this the broker will issue warning logs
@@ -156,6 +180,11 @@ pub struct MarketConf {
     ///
     /// If not set, files will be re-downloaded every time
     pub cache_dir: Option<PathBuf>,
+    /// Maximum number of orders to concurrently work on pricing
+    ///
+    /// Used to limit pricing tasks spawned to prevent overwhelming the system
+    #[serde(default = "defaults::max_concurrent_preflights")]
+    pub max_concurrent_preflights: u32,
 }
 
 impl Default for MarketConf {
@@ -163,16 +192,16 @@ impl Default for MarketConf {
         // Allow use of assumption_price until it is removed.
         #[allow(deprecated)]
         Self {
-            mcycle_price: "0.1".to_string(),
-            mcycle_price_stake_token: "0.1".to_string(),
+            mcycle_price: "0.00001".to_string(),
+            mcycle_price_stake_token: "0.001".to_string(),
             assumption_price: None,
             max_mcycle_limit: None,
+            allow_skip_mcycle_limit_addresses: None,
             max_journal_bytes: defaults::max_journal_bytes(), // 10 KB
             peak_prove_khz: None,
-            min_deadline: 300, // 5 mins
+            min_deadline: 120, // 2 mins
             lookback_blocks: 100,
             max_stake: "0.1".to_string(),
-            skip_preflight_ids: None,
             allow_client_addresses: None,
             lockin_priority_gas: None,
             max_file_size: 50_000_000,
@@ -180,12 +209,14 @@ impl Default for MarketConf {
             lockin_gas_estimate: defaults::lockin_gas_estimate(),
             fulfill_gas_estimate: defaults::fulfill_gas_estimate(),
             groth16_verify_gas_estimate: defaults::groth16_verify_gas_estimate(),
+            additional_proof_cycles: defaults::additional_proof_cycles(),
             balance_warn_threshold: None,
             balance_error_threshold: None,
             stake_balance_warn_threshold: None,
             stake_balance_error_threshold: None,
             max_concurrent_proofs: None,
             cache_dir: None,
+            max_concurrent_preflights: defaults::max_concurrent_preflights(),
         }
     }
 }
@@ -229,6 +260,19 @@ pub struct ProverConf {
     /// will be retried, but after this number of retries, the process will exit.
     /// None indicates there are infinite number of retries.
     pub max_critical_task_retries: Option<u32>,
+    /// Interval for checking expired committed orders (in seconds)
+    ///
+    /// This is the interval at which the ReaperTask will check for expired orders and mark them as failed.
+    /// If not set, it defaults to 60 seconds.
+    #[serde(default = "defaults::reaper_interval_secs")]
+    pub reaper_interval_secs: u32,
+    /// Grace period before marking expired orders as failed (in seconds)
+    ///
+    /// This provides a buffer time after an order expires before the reaper marks it as failed.
+    /// This helps prevent race conditions with the aggregator that might be processing the order.
+    /// If not set, it defaults to 30 seconds.
+    #[serde(default = "defaults::reaper_grace_period_secs")]
+    pub reaper_grace_period_secs: u32,
 }
 
 impl Default for ProverConf {
@@ -244,6 +288,8 @@ impl Default for ProverConf {
             set_builder_guest_path: None,
             assessor_set_guest_path: None,
             max_critical_task_retries: None,
+            reaper_interval_secs: defaults::reaper_interval_secs(),
+            reaper_grace_period_secs: defaults::reaper_grace_period_secs(),
         }
     }
 }
@@ -255,7 +301,7 @@ pub struct BatcherConfig {
     pub batch_max_time: Option<u64>,
     /// Batch size (in proofs) before publishing
     #[serde(alias = "batch_size")]
-    pub min_batch_size: Option<u64>,
+    pub min_batch_size: Option<u32>,
     /// Max combined journal size (in bytes) that once exceeded will trigger a publish
     #[serde(default = "defaults::batch_max_journal_bytes")]
     pub batch_max_journal_bytes: usize,
@@ -275,10 +321,13 @@ pub struct BatcherConfig {
     pub batch_poll_time_ms: Option<u64>,
     /// Use the single TXN submission that batches submit_merkle / fulfill_batch into
     ///
-    /// A single transaction. Requires the `submitRootAndFulfillBatch` method
+    /// A single transaction. Requires the `submitRootAndFulfill` method
     /// be present on the deployed contract
     #[serde(default)]
     pub single_txn_fulfill: bool,
+    /// Whether to withdraw from the prover balance when fulfilling
+    #[serde(default)]
+    pub withdraw: bool,
     /// Number of attempts to make to submit a batch before abandoning
     #[serde(default = "defaults::max_submission_attempts")]
     pub max_submission_attempts: u32,
@@ -295,6 +344,7 @@ impl Default for BatcherConfig {
             txn_timeout: None,
             batch_poll_time_ms: Some(1000),
             single_txn_fulfill: false,
+            withdraw: false,
             max_submission_attempts: defaults::max_submission_attempts(),
         }
     }
@@ -314,8 +364,10 @@ pub struct Config {
 impl Config {
     /// Load the config from disk
     pub async fn load(path: &Path) -> Result<Self> {
-        let data = fs::read_to_string(path).await.context("Failed to read config file")?;
-        toml::from_str(&data).context("Failed to parse toml file")
+        let data = fs::read_to_string(path)
+            .await
+            .context(format!("Failed to read config file from {path:?}"))?;
+        toml::from_str(&data).context(format!("Failed to parse toml file from {path:?}"))
     }
 
     /// Write the config to disk
@@ -462,7 +514,6 @@ impl ConfigWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::hex::FromHex;
     use std::{
         fs::File,
         io::{Seek, Write},
@@ -478,7 +529,6 @@ peak_prove_khz = 500
 min_deadline = 300
 lookback_blocks = 100
 max_stake = "0.1"
-skip_preflight_ids = ["0x0000000000000000000000000000000000000000000000000000000000000001"]
 max_file_size = 50_000_000
 
 [prover]
@@ -505,7 +555,6 @@ peak_prove_khz = 10000
 min_deadline = 300
 lookback_blocks = 100
 max_stake = "0.1"
-skip_preflight_ids = ["0x0000000000000000000000000000000000000000000000000000000000000001"]
 max_file_size = 50_000_000
 max_fetch_retries = 10
 allow_client_addresses = ["0x0000000000000000000000000000000000000000"]
@@ -527,7 +576,8 @@ batch_size = 3
 block_deadline_buffer_secs = 120
 txn_timeout = 45
 batch_poll_time_ms = 1200
-single_txn_fulfill = true"#;
+single_txn_fulfill = true
+withdraw = true"#;
 
     const BAD_CONFIG: &str = r#"
 [market]
@@ -553,11 +603,6 @@ error = ?"#;
         assert_eq!(config.market.lookback_blocks, 100);
         assert_eq!(config.market.max_stake, "0.1");
         assert_eq!(config.market.max_file_size, 50_000_000);
-        assert_eq!(
-            config.market.skip_preflight_ids.unwrap()[0],
-            B256::from_hex("0x0000000000000000000000000000000000000000000000000000000000000001")
-                .unwrap()
-        );
         assert_eq!(config.market.lockin_priority_gas, None);
 
         assert_eq!(config.prover.status_poll_ms, 1000);
@@ -631,6 +676,7 @@ error = ?"#;
             assert_eq!(config.batcher.batch_poll_time_ms, Some(1200));
             assert_eq!(config.batcher.min_batch_size, Some(3));
             assert!(config.batcher.single_txn_fulfill);
+            assert!(config.batcher.withdraw);
         }
         tracing::debug!("closing...");
     }

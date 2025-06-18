@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{watch, Notify, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use alloy::{eips::BlockNumberOrTag, providers::Provider};
 use anyhow::{Context, Result};
@@ -21,7 +22,9 @@ use crate::{
 
 #[derive(Error)]
 pub enum ChainMonitorErr {
-    #[error("{code} Unexpected error: {0}", code = self.code())]
+    #[error("{code} RPC error: {0:?}", code = self.code())]
+    RpcErr(anyhow::Error),
+    #[error("{code} Unexpected error: {0:?}", code = self.code())]
     UnexpectedErr(#[from] anyhow::Error),
 }
 
@@ -30,62 +33,55 @@ impl_coded_debug!(ChainMonitorErr);
 impl CodedError for ChainMonitorErr {
     fn code(&self) -> &str {
         match self {
+            ChainMonitorErr::RpcErr(_) => "[B-CHM-400]",
             ChainMonitorErr::UnexpectedErr(_) => "[B-CHM-500]",
         }
     }
 }
 
+#[derive(Clone, Debug, Copy)]
+pub(crate) struct ChainHead {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+}
+
 #[derive(Clone)]
 pub struct ChainMonitorService<P> {
     provider: Arc<P>,
-    block_number: watch::Sender<u64>,
-    block_timestamp: watch::Sender<u64>,
     gas_price: watch::Sender<u128>,
     update_notifier: Arc<Notify>,
     next_update: Arc<RwLock<Instant>>,
+    head_update: watch::Sender<ChainHead>,
 }
 
 impl<P: Provider> ChainMonitorService<P> {
     pub async fn new(provider: Arc<P>) -> Result<Self> {
-        let (block_number, _) = watch::channel(0);
         let (gas_price, _) = watch::channel(0);
-        let (block_timestamp, _) = watch::channel(0);
+        let (head_update, _) = watch::channel(ChainHead { block_number: 0, block_timestamp: 0 });
 
         Ok(Self {
             provider,
-            block_number,
-            block_timestamp,
             gas_price,
             update_notifier: Arc::new(Notify::new()),
             next_update: Arc::new(RwLock::new(Instant::now())),
+            head_update,
         })
     }
 
     /// Returns the latest block number, triggering an update if enough time has passed
     pub async fn current_block_number(&self) -> Result<u64> {
-        if Instant::now() > *self.next_update.read().await {
-            let mut rx = self.block_number.subscribe();
-            self.update_notifier.notify_one();
-            rx.changed().await.context("failed to query block number from chain monitor")?;
-
-            let block_number = *rx.borrow();
-            Ok(block_number)
-        } else {
-            Ok(*self.block_number.borrow())
-        }
+        self.current_chain_head().await.map(|head| head.block_number)
     }
 
-    /// Returns the latest block timestamp, triggering an update if enough time has passed
-    pub async fn current_block_timestamp(&self) -> Result<u64> {
+    pub(crate) async fn current_chain_head(&self) -> Result<ChainHead> {
         if Instant::now() > *self.next_update.read().await {
-            let mut rx = self.block_timestamp.subscribe();
+            let mut rx = self.head_update.subscribe();
             self.update_notifier.notify_one();
-            rx.changed().await.context("failed to query block timestamp from chain monitor")?;
-
-            let block_timestamp = *rx.borrow();
-            Ok(block_timestamp)
+            rx.changed().await.context("failed to query head update from chain monitor")?;
+            let chain_head = *rx.borrow();
+            Ok(chain_head)
         } else {
-            Ok(*self.block_timestamp.borrow())
+            Ok(*self.head_update.borrow())
         }
     }
 
@@ -96,7 +92,6 @@ impl<P: Provider> ChainMonitorService<P> {
             let mut rx = self.gas_price.subscribe();
             self.update_notifier.notify_one();
             rx.changed().await.context("failed to query gas price from chain monitor")?;
-
             let gas_price = *rx.borrow();
             Ok(gas_price)
         } else {
@@ -110,7 +105,7 @@ where
     P: Provider + 'static + Clone,
 {
     type Error = ChainMonitorErr;
-    fn spawn(&self) -> RetryRes<Self::Error> {
+    fn spawn(&self, cancel_token: CancellationToken) -> RetryRes<Self::Error> {
         let self_clone = self.clone();
 
         Box::pin(async move {
@@ -131,36 +126,49 @@ where
                 .unwrap_or(Duration::from_secs(2));
 
             loop {
-                // Wait for notification
-                self_clone.update_notifier.notified().await;
-                // Needs update, lock next update value to avoid unnecessary notifications.
-                let mut next_update = self_clone.next_update.write().await;
+                tokio::select! {
+                    // Wait for notification or handle cancellation
+                    _ = self_clone.update_notifier.notified() => {
+                        // Needs update, lock next update value to avoid unnecessary notifications.
+                        let mut next_update = self_clone.next_update.write().await;
 
-                // Get the lastest block and gas price.
-                let (block_res, gas_price_res) = tokio::join!(
-                    self_clone.provider.get_block_by_number(BlockNumberOrTag::Latest),
-                    self_clone.provider.get_gas_price()
-                );
+                        // Get the lastest block and gas price.
+                        let (block_res, gas_price_res) = tokio::join!(
+                            self_clone.provider.get_block_by_number(BlockNumberOrTag::Latest),
+                            self_clone.provider.get_gas_price()
+                        );
 
-                let block = block_res
-                    .context("failed to latest block")
-                    .map_err(ChainMonitorErr::UnexpectedErr)
-                    .map_err(SupervisorErr::Recover)?
-                    .context("failed to fetch latest block: no block in response")
-                    .map_err(ChainMonitorErr::UnexpectedErr)
-                    .map_err(SupervisorErr::Recover)?;
-                let _ = self_clone.block_number.send_replace(block.header.number);
-                let _ = self_clone.block_timestamp.send_replace(block.header.timestamp);
+                        let block = block_res
+                            .context("failed to latest block")
+                            .map_err(ChainMonitorErr::RpcErr)
+                            .map_err(SupervisorErr::Recover)?
+                            .context("failed to fetch latest block: no block in response")
+                            .map_err(ChainMonitorErr::UnexpectedErr)
+                            .map_err(SupervisorErr::Recover)?;
+                        let head = ChainHead {
+                            block_number: block.header.number,
+                            block_timestamp: block.header.timestamp,
+                        };
+                        let _ = self_clone.head_update.send_replace(head);
 
-                let gas_price = gas_price_res
-                    .context("failed to get gas price")
-                    .map_err(ChainMonitorErr::UnexpectedErr)
-                    .map_err(SupervisorErr::Recover)?;
-                let _ = self_clone.gas_price.send_replace(gas_price);
+                        let gas_price = gas_price_res
+                            .context("failed to get gas price")
+                            .map_err(ChainMonitorErr::RpcErr)
+                            .map_err(SupervisorErr::Recover)?;
+                        let _ = self_clone.gas_price.send_replace(gas_price);
 
-                // Set timestamp for next update
-                *next_update = Instant::now() + chain_poll_time;
+                        // Set timestamp for next update
+                        *next_update = Instant::now() + chain_poll_time;
+                    }
+                    // Handle cancellation
+                    _ = cancel_token.cancelled() => {
+                        tracing::debug!("Chain monitor received cancellation, shutting down gracefully");
+                        break;
+                    }
+                }
             }
+
+            Ok(())
         })
     }
 }
@@ -190,7 +198,7 @@ mod tests {
         );
 
         let chain_monitor = Arc::new(ChainMonitorService::new(provider.clone()).await.unwrap());
-        tokio::spawn(chain_monitor.spawn());
+        tokio::spawn(chain_monitor.spawn(CancellationToken::new()));
 
         let block = chain_monitor.current_block_number().await.unwrap();
         assert_eq!(block, 0);

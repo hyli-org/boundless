@@ -3,7 +3,8 @@ import * as aws from '@pulumi/aws';
 import * as awsx from '@pulumi/awsx';
 import * as docker_build from '@pulumi/docker-build';
 import * as pulumi from '@pulumi/pulumi';
-import { getServiceNameV1 } from '../../util';
+import { getServiceNameV1, Severity } from '../../util';
+import * as crypto from 'crypto';
 
 const SERVICE_NAME_BASE = 'order-stream';
 const HEALTH_CHECK_PATH = '/api/v1/health';
@@ -23,14 +24,17 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
       privSubNetIds: pulumi.Output<string[]>;
       pubSubNetIds: pulumi.Output<string[]>;
       githubTokenSecret?: pulumi.Output<string>;
-      minBalance: string;
+      minBalanceRaw: string;
       boundlessAddress: string;
       vpcId: pulumi.Output<string>;
       rdsPassword: pulumi.Output<string>;
       albDomain?: pulumi.Output<string>;
       ethRpcUrl: pulumi.Output<string>;
       bypassAddrs: string;
-      boundlessAlertsTopicArn?: string;
+      // If true, we don't add the cert to the load balancer. Used during initial cert creation.
+      // to avoid adding the cert to the load balancer before the cert is ready.
+      disableCert: boolean;
+      boundlessAlertsTopicArns?: string[];
     },
     opts?: pulumi.ComponentResourceOptions
   ) {
@@ -45,25 +49,33 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
       privSubNetIds,
       pubSubNetIds,
       githubTokenSecret,
-      minBalance,
+      minBalanceRaw,
       boundlessAddress,
       vpcId,
       rdsPassword,
       albDomain,
       ethRpcUrl,
       bypassAddrs,
+      boundlessAlertsTopicArns,
+      disableCert,
     } = args;
 
     const stackName = pulumi.getStack();
     const serviceName = getServiceNameV1(stackName, SERVICE_NAME_BASE);
+    const isStaging = stackName.includes('staging');
 
     // If we're in prod and have a domain, create a cert
     let cert: aws.acm.Certificate | undefined;
+    let certValidation: aws.acm.CertificateValidation | undefined;
     if (stackName.includes('prod') && albDomain) {
       cert = new aws.acm.Certificate(`${serviceName}-cert`, {
         domainName: pulumi.interpolate`${albDomain}`,
         validationMethod: "DNS",
       }, { protect: true });
+
+      certValidation = new aws.acm.CertificateValidation(`${serviceName}-cert-validation`, {
+        certificateArn: cert.arn,
+      });
     }
 
     const ecrRepository = new awsx.ecr.Repository(`${serviceName}-repo`, {
@@ -140,19 +152,22 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
     });
 
     // If we have a cert and a domain, use it, and enable https.
-    // Otherwise we use the default lb endpoint that AWS provides that only supports http.
-    let listener: awsx.types.input.lb.ListenerArgs;
-    if (cert && albDomain) {
-      listener = {
+    let listeners: awsx.types.input.lb.ListenerArgs[] = [{
+      port: 80,
+      protocol: 'HTTP',
+    }];
+    if (cert && albDomain && certValidation && !disableCert) {
+      listeners.push({
         port: 443,
         protocol: 'HTTPS',
-        certificateArn: cert.arn.apply((arn) => arn),
-      };
-    } else {
-      listener = {
-        port: 80,
-        protocol: 'HTTP',
-      };
+        certificateArn: certValidation.certificateArn,
+      });
+
+      // For sepolia, we need to swap the order of the listeners so that the https listener is first.
+      // On sepolia prod the https listener was deployed first, and we aren't able to change the order.
+      if (chainId === '11155111') {
+        listeners = [listeners[1], listeners[0]];
+      }
     }
 
     // Protect the load balancer so it doesn't get deleted if the stack is accidently modified/deleted
@@ -160,7 +175,7 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
     const loadbalancer = new awsx.lb.ApplicationLoadBalancer(`${serviceName}-lb`, {
       name: `${serviceName}-lb`,
       subnetIds: pubSubNetIds,
-      listener,
+      listeners,
       defaultTargetGroup: {
         name: `${serviceName}-tg`,
         port: 8585,
@@ -177,7 +192,7 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
       },
       // This should be slightly greater than the order-steam configured ping/pong time
       idleTimeout: orderStreamPingTime + orderStreamPingTime * 0.2,
-    }, { protect: true });
+    }, { protect: isStaging ? false : true });
 
     const orderStreamSecGroup = new aws.ec2.SecurityGroup(`${serviceName}-sg`, {
       name: `${serviceName}-sg`,
@@ -254,7 +269,7 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
       dbSubnetGroupName: dbSubnets.name,
       vpcSecurityGroupIds: [rdsSecurityGroup.id],
       storageType: 'gp3',
-    }, { protect: true });
+    }, { protect: isStaging ? false : true });
 
     const webAcl = new aws.wafv2.WebAcl(`${serviceName}-acl`, {
       defaultAction: {
@@ -316,10 +331,19 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
     });
 
     const dbUrlSecret = new aws.secretsmanager.Secret(`${serviceName}-db-url`);
+    const dbUrlSecretValue = pulumi.interpolate`postgres://${rdsUser}:${rdsPassword}@${rds.address}:${rdsPort}/${rdsDbName}?sslmode=require`;
     new aws.secretsmanager.SecretVersion(`${serviceName}-db-url-ver`, {
       secretId: dbUrlSecret.id,
-      secretString: pulumi.interpolate`postgres://${rdsUser}:${rdsPassword}@${rds.address}:${rdsPort}/${rdsDbName}?sslmode=require`,
+      secretString: dbUrlSecretValue
     });
+
+    const secretHash = pulumi
+      .all([dbUrlSecretValue])
+      .apply(([_dbUrlSecretValue]: any[]) => {
+        const hash = crypto.createHash("sha1");
+        hash.update(_dbUrlSecretValue);
+        return hash.digest("hex");
+      });
 
     const dbSecretAccessPolicy = new aws.iam.Policy(`${serviceName}-db-url-policy`, {
       policy: dbUrlSecret.arn.apply((secretArn): aws.iam.PolicyDocument => {
@@ -431,8 +455,8 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
             ethRpcUrl,
             '--boundless-market-address',
             boundlessAddress,
-            '--min-balance',
-            minBalance,
+            '--min-balance-raw',
+            minBalanceRaw,
             '--bypass-addrs',
             bypassAddrs,
             '--domain',
@@ -481,7 +505,7 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
       },
     });
 
-    const alarmActions = args.boundlessAlertsTopicArn ? [args.boundlessAlertsTopicArn] : [];
+    const alarmActions = boundlessAlertsTopicArns ?? [];
 
     new aws.cloudwatch.LogMetricFilter(`${serviceName}-log-err-filter`, {
       name: `${serviceName}-log-err-filter`,
@@ -496,9 +520,9 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
       pattern: `"ERROR "`,
     }, { dependsOn: [service] });
 
-    // Two errors within an hour triggers alarm.
-    new aws.cloudwatch.MetricAlarm(`${serviceName}-error-alarm`, {
-      name: `${serviceName}-log-err`,
+    // Two errors within an hour triggers SEV2 alarm.
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-error-${Severity.SEV2}-alarm`, {
+      name: `${serviceName}-${Severity.SEV2}-log-err`,
       metricQueries: [
         {
           id: 'm1',
@@ -517,7 +541,33 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
       evaluationPeriods: 60,
       datapointsToAlarm: 2,
       treatMissingData: 'notBreaching',
-      alarmDescription: 'Order stream log ERROR level',
+      alarmDescription: 'Order stream: 2 ERROR logs within an hour',
+      actionsEnabled: true,
+      alarmActions,
+    });
+
+    // Two errors within an hour triggers SEV2 alarm.
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-error-${Severity.SEV1}-alarm`, {
+      name: `${serviceName}-${Severity.SEV1}-log-err`,
+      metricQueries: [
+        {
+          id: 'm1',
+          metric: {
+            namespace: `Boundless/Services/${serviceName}`,
+            metricName: `${serviceName}-log-err`,
+            period: 60,
+            stat: 'Sum',
+          },
+          returnData: true,
+        },
+      ],
+      threshold: 1,
+      comparisonOperator: 'GreaterThanOrEqualToThreshold',
+      // Five errors within an hour triggers alarm.
+      evaluationPeriods: 60,
+      datapointsToAlarm: 5,
+      treatMissingData: 'notBreaching',
+      alarmDescription: 'Order stream: 5 ERROR logs within an hour',
       actionsEnabled: true,
       alarmActions,
     });
@@ -530,10 +580,8 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
     const loadBalancerId = pulumi.interpolate`${loadbalancer.loadBalancer.arn.apply((arn) => arn.split('/').pop())}`;
     const targetGroupId = pulumi.interpolate`targetgroup/${loadbalancer.defaultTargetGroup.arn.apply((arn) => arn.split('/').pop())}`;
 
-    new aws.cloudwatch.MetricAlarm(`${serviceName}-health-check-alarm`, {
-      name: `${serviceName}-health-check-alarm`,
-      comparisonOperator: 'GreaterThanOrEqualToThreshold',
-      evaluationPeriods: 1,
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-health-check-alarm-${Severity.SEV2}`, {
+      name: `${serviceName}-health-check-alarm-${Severity.SEV2}`,
       metricName: `UnHealthyHostCount`,
       dimensions: {
         TargetGroup: targetGroupId,
@@ -541,9 +589,91 @@ export class OrderStreamInstance extends pulumi.ComponentResource {
       },
       namespace: 'AWS/ApplicationELB',
       period: 60,
+      comparisonOperator: 'GreaterThanOrEqualToThreshold',
+      evaluationPeriods: 60,
+      datapointsToAlarm: 2,
       statistic: 'Sum',
       threshold: 1,
-      alarmDescription: 'Order stream health check alarm',
+      alarmDescription: 'Order stream health check alarm failed 2 times within an hour',
+      actionsEnabled: true,
+      alarmActions,
+    });
+
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-health-check-alarm-${Severity.SEV1}`, {
+      name: `${serviceName}-health-check-alarm-${Severity.SEV1}`,
+      metricName: `UnHealthyHostCount`,
+      dimensions: {
+        TargetGroup: targetGroupId,
+        LoadBalancer: loadBalancerId,
+      },
+      namespace: 'AWS/ApplicationELB',
+      period: 60,
+      comparisonOperator: 'GreaterThanOrEqualToThreshold',
+      evaluationPeriods: 60,
+      datapointsToAlarm: 5,
+      statistic: 'Sum',
+      threshold: 1,
+      alarmDescription: 'Order stream health check alarm failed 5 times within an hour',
+      actionsEnabled: true,
+      alarmActions,
+    });
+
+    new aws.cloudwatch.LogMetricFilter(`${serviceName}-fatal-filter`, {
+      name: `${serviceName}-log-fatal-filter`,
+      logGroupName: serviceName,
+      metricTransformation: {
+        namespace: `Boundless/Services/${serviceName}`,
+        name: `${serviceName}-log-fatal`,
+        value: '1',
+        defaultValue: '0',
+      },
+      pattern: 'FATAL',
+    }, { dependsOn: [service] });
+
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-fatal-alarm-${Severity.SEV2}`, {
+      name: `${serviceName}-log-fatal-${Severity.SEV2}`,
+      metricQueries: [
+        {
+          id: 'm1',
+          metric: {
+            namespace: `Boundless/Services/${serviceName}`,
+            metricName: `${serviceName}-log-fatal`,
+            period: 60,
+            stat: 'Sum',
+          },
+          returnData: true,
+        },
+      ],
+      threshold: 1,
+      comparisonOperator: 'GreaterThanOrEqualToThreshold',
+      evaluationPeriods: 60,
+      datapointsToAlarm: 1,
+      treatMissingData: 'notBreaching',
+      alarmDescription: `Order stream FATAL (task exited) 1 time within an hour`,
+      actionsEnabled: true,
+      alarmActions,
+    });
+
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-fatal-alarm-${Severity.SEV1}`, {
+      name: `${serviceName}-log-fatal-${Severity.SEV1}`,
+      metricQueries: [
+        {
+          id: 'm1',
+          metric: {
+            namespace: `Boundless/Services/${serviceName}`,
+            metricName: `${serviceName}-log-fatal`,
+            period: 60,
+            stat: 'Sum',
+          },
+          returnData: true,
+        },
+      ],
+      threshold: 1,
+      comparisonOperator: 'GreaterThanOrEqualToThreshold',
+      evaluationPeriods: 60,
+      datapointsToAlarm: 3,
+      treatMissingData: 'notBreaching',
+      alarmDescription: `Order stream FATAL (task exited) 3 times within an hour`,
       actionsEnabled: true,
       alarmActions,
     });

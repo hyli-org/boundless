@@ -40,7 +40,7 @@ This overview is aimed at app developers i.e., requestors, and therefore for sim
 
 The app developer begins their Boundless journey by writing an application for the zkVM in Rust. The zkVM provides a zero-knowledge proof of the correct execution of this program. A proof of execution is a receipt; it contains the output― the journal and the cryptographic proof - the seal. The seal is the cryptographic proof. In [zkVM terminology](https://dev.risczero.com/terminology#seal), the seal usually refers to a zk-STARK or SNARK. In Boundless, the seal is a Merkle inclusion proof into an aggregated proof.
 
-With a zkVM program ready, the app developer will require some way to carry out proving. This can be done [locally](https://dev.risczero.com/api/generating-proofs/local-proving), but requires significant hardware investment and maintenance long-term, especially to enable parallelized GPU proving The Boundless Market allows for anyone to request a proof, regardless of their hardware, they are known as requestors. Boundless handles the connection between requestors and provers i.e., people with dedicated and significant proving hardware, to facilitate proving in a decentralized and permissionless manner.
+With a zkVM program ready, the app developer will require some way to carry out proving. This can be done [locally](https://dev.risczero.com/api/generating-proofs/local-proving), but requires significant hardware investment and maintenance long-term, especially to enable parallelized GPU proving. The Boundless Market allows for anyone to request a proof, regardless of their hardware, they are known as requestors. Boundless handles the connection between requestors and provers i.e., people with dedicated and significant proving hardware, to facilitate proving in a decentralized and permissionless manner.
 
 > To read more about the specifics of the proofs returned from the Boundless market, please see [Use a Proof](/developers/tutorials/use).
 
@@ -76,9 +76,9 @@ For example, an offer might specify:
 | Bidding start            | Latest block number + 3 |
 | Length of ramp-up period | 10 blocks               |
 | Timeout                  | 100 blocks              |
-| Lock-in stake            | 5 HP                    |
+| Lock-in stake            | 5 USDC                  |
 
-For more details, please see [Pricing a Request](/developers/tutorials/request#pricing-a-request).
+For more details, please see [Pricing a Request](/developers/tutorials/pricing).
 
 #### BoundlessMarket.sol - `submitRequest`
 
@@ -125,7 +125,7 @@ The requirements of the proof specify the exact program that must be run (identi
 
 After a proof request is broadcast, a reverse Dutch auction runs according to the parameters specified by the offer.
 
-From the moment the request is broadcast to the start of bidding, the auction price is the minimum specified in the offer. During the ramp-up period, the price is increased linearly up to the maximum price. After the ramp-up period the price stays at the max price until the request expires. At any time, a prover can submit a bid, accepting the current price and winning the auction. Because the price only increases, the first bid is the best price for the requestor.
+From the moment the request is broadcast, the auction price is the set at the minimum price specified in the offer. During the ramp-up period, the price is increased linearly up to the maximum price. After the ramp-up period, the price stays at the max price until the request expires. At any time, a prover can submit a bid, accepting the current price and winning the auction. Because the price only increases, the first bid is the best price for the requestor.
 
 When the prover submits their bid, the auction ends and they "lock-in" the request. Once a request is locked, only that prover can be paid for submitting a proof. This ensures that the prover will not waste their compute resources, as they know no other prover can take the request instead. By increasing market efficiency, this lowers prices.
 
@@ -168,16 +168,21 @@ The requestor can use this Merkle inclusion proof as an effective representation
 
 ### 5. The App Developer Retrieves Their Proof, to Use in Their Application
 
-When the prover fulfills their request, the requestor will (the app developer) will receive their proof.
+When the prover fulfills their request, the requestor (the app developer) will receive their proof.
 
 <StripRustCodeComments>
 ```rust
 # use std::time::Duration;
-# use boundless_market::client::ClientBuilder;
+# use boundless_market::{Client, storage::storage_provider_from_env};
+# use alloy::signers::local::LocalSigner;
 # use boundless_market::contracts::ProofRequest;
 # async fn submit_request(request: ProofRequest) -> anyhow::Result<()> {
-# let boundless_client = ClientBuilder::new().build().await?;
-# let (request_id, expires_at) = boundless_client.submit_request(&request).await?;
+# let boundless_client = Client::builder()
+#    .with_private_key(LocalSigner::random())
+#    .with_storage_provider(Some(storage_provider_from_env()?))
+#    .build()
+#    .await?;
+# let (request_id, expires_at) = boundless_client.submit_request_onchain(&request).await?;
 let (_journal, seal) = boundless_client
   .wait_for_request_fulfillment(
     request_id,

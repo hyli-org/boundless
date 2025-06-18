@@ -3,7 +3,7 @@ import * as aws from "@pulumi/aws";
 import { BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN, BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN } from "../accountConstants";
 import { BasePipelineArgs } from "./base";
 
-interface OrderGeneratorPipelineArgs extends BasePipelineArgs {}
+interface OrderGeneratorPipelineArgs extends BasePipelineArgs { }
 
 // The name of the app that we are deploying. Must match the name of the directory in the infra directory.
 const APP_NAME = "order-generator";
@@ -59,7 +59,7 @@ export class OrderGeneratorPipeline extends pulumi.ComponentResource {
       secretId: githubTokenSecret.id,
       secretString: githubToken,
     });
-    
+
     new aws.secretsmanager.SecretVersion(`${APP_NAME}-dockerTokenVersion`, {
       secretId: dockerTokenSecret.id,
       secretString: dockerToken,
@@ -79,15 +79,33 @@ export class OrderGeneratorPipeline extends pulumi.ComponentResource {
       },
     });
 
-    const stagingDeployment = new aws.codebuild.Project(
-      `${APP_NAME}-staging-build`,
-      this.codeBuildProjectArgs(APP_NAME, "staging", role, BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN, dockerUsername, dockerTokenSecret, githubTokenSecret),
+    const stagingDeploymentEthSepolia = new aws.codebuild.Project(
+      `${APP_NAME}-staging-11155111-build`,
+      this.codeBuildProjectArgs(APP_NAME, "staging-11155111", role, BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN, dockerUsername, dockerTokenSecret, githubTokenSecret),
       { dependsOn: [role] }
     );
 
-    const prodDeployment = new aws.codebuild.Project(
-      `${APP_NAME}-prod-build`,
-      this.codeBuildProjectArgs(APP_NAME, "prod", role, BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN, dockerUsername, dockerTokenSecret, githubTokenSecret),
+    const stagingDeploymentBaseSepolia = new aws.codebuild.Project(
+      `${APP_NAME}-staging-84532-build`,
+      this.codeBuildProjectArgs(APP_NAME, "staging-84532", role, BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN, dockerUsername, dockerTokenSecret, githubTokenSecret),
+      { dependsOn: [role] }
+    );
+
+    const prodDeploymentEthSepolia = new aws.codebuild.Project(
+      `${APP_NAME}-prod-11155111-build`,
+      this.codeBuildProjectArgs(APP_NAME, "prod-11155111", role, BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN, dockerUsername, dockerTokenSecret, githubTokenSecret),
+      { dependsOn: [role] }
+    );
+
+    const prodDeploymentBaseMainnet = new aws.codebuild.Project(
+      `${APP_NAME}-prod-8453-build`,
+      this.codeBuildProjectArgs(APP_NAME, "prod-8453", role, BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN, dockerUsername, dockerTokenSecret, githubTokenSecret),
+      { dependsOn: [role] }
+    );
+
+    const prodDeploymentBaseSepolia = new aws.codebuild.Project(
+      `${APP_NAME}-prod-84532-build`,
+      this.codeBuildProjectArgs(APP_NAME, "prod-84532", role, BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN, dockerUsername, dockerTokenSecret, githubTokenSecret),
       { dependsOn: [role] }
     );
 
@@ -101,34 +119,47 @@ export class OrderGeneratorPipeline extends pulumi.ComponentResource {
         {
           name: "Github",
           actions: [{
-              name: "Github",
-              category: "Source",
-              owner: "AWS",
-              provider: "CodeStarSourceConnection",
-              version: "1",
-              outputArtifacts: ["source_output"],
-              configuration: {
-                  ConnectionArn: connection.arn,
-                  FullRepositoryId: "boundless-xyz/boundless",
-                  BranchName: BRANCH_NAME,
-                  OutputArtifactFormat: "CODEBUILD_CLONE_REF"
-              },
+            name: "Github",
+            category: "Source",
+            owner: "AWS",
+            provider: "CodeStarSourceConnection",
+            version: "1",
+            outputArtifacts: ["source_output"],
+            configuration: {
+              ConnectionArn: connection.arn,
+              FullRepositoryId: "boundless-xyz/boundless",
+              BranchName: BRANCH_NAME,
+              OutputArtifactFormat: "CODEBUILD_CLONE_REF"
+            },
           }],
         },
         {
           name: "DeployStaging",
           actions: [
             {
-              name: "DeployStaging",
+              name: "DeployStagingEthSepolia",
               category: "Build",
               owner: "AWS",
               provider: "CodeBuild",
               version: "1",
               runOrder: 1,
               configuration: {
-                ProjectName: stagingDeployment.name
+                ProjectName: stagingDeploymentEthSepolia.name
               },
-              outputArtifacts: ["staging_output"],
+              outputArtifacts: ["staging_output_eth_sepolia"],
+              inputArtifacts: ["source_output"],
+            },
+            {
+              name: "DeployStagingBaseSepolia",
+              category: "Build",
+              owner: "AWS",
+              provider: "CodeBuild",
+              version: "1",
+              runOrder: 1,
+              configuration: {
+                ProjectName: stagingDeploymentBaseSepolia.name
+              },
+              outputArtifacts: ["staging_output_base_sepolia"],
               inputArtifacts: ["source_output"],
             }
           ]
@@ -136,25 +167,61 @@ export class OrderGeneratorPipeline extends pulumi.ComponentResource {
         {
           name: "DeployProduction",
           actions: [
-            { name: "ApproveDeployToProduction", 
-              category: "Approval", 
-              owner: "AWS", 
-              provider: "Manual", 
-              version: "1", 
+            {
+              name: "ApproveDeployToProductionWave1",
+              category: "Approval",
+              owner: "AWS",
+              provider: "Manual",
+              version: "1",
               runOrder: 1,
               configuration: {}
             },
             {
-              name: "DeployProduction",
+              name: "DeployProductionBaseSepolia",
               category: "Build",
               owner: "AWS",
               provider: "CodeBuild",
               version: "1",
               runOrder: 2,
               configuration: {
-                ProjectName: prodDeployment.name
+                ProjectName: prodDeploymentBaseSepolia.name
               },
-              outputArtifacts: ["production_output"],
+              outputArtifacts: ["production_output_base_sepolia"],
+              inputArtifacts: ["source_output"],
+            },
+            {
+              name: "ApproveDeployToProductionWave2",
+              category: "Approval",
+              owner: "AWS",
+              provider: "Manual",
+              version: "1",
+              runOrder: 3,
+              configuration: {}
+            },
+            {
+              name: "DeployProductionEthSepolia",
+              category: "Build",
+              owner: "AWS",
+              provider: "CodeBuild",
+              version: "1",
+              runOrder: 4,
+              configuration: {
+                ProjectName: prodDeploymentEthSepolia.name
+              },
+              outputArtifacts: ["production_output_eth_sepolia"],
+              inputArtifacts: ["source_output"],
+            },
+            {
+              name: "DeployProductionBaseMainnet",
+              category: "Build",
+              owner: "AWS",
+              provider: "CodeBuild",
+              version: "1",
+              runOrder: 4,
+              configuration: {
+                ProjectName: prodDeploymentBaseMainnet.name
+              },
+              outputArtifacts: ["production_output_base_mainnet"],
               inputArtifacts: ["source_output"],
             }
           ]
@@ -196,12 +263,12 @@ export class OrderGeneratorPipeline extends pulumi.ComponentResource {
   }
 
   private codeBuildProjectArgs(
-    appName: string, 
-    stackName: string, 
-    role: aws.iam.Role, 
-    serviceAccountRoleArn: string, 
-    dockerUsername: string, 
-    dockerTokenSecret: aws.secretsmanager.Secret, 
+    appName: string,
+    stackName: string,
+    role: aws.iam.Role,
+    serviceAccountRoleArn: string,
+    dockerUsername: string,
+    dockerTokenSecret: aws.secretsmanager.Secret,
     githubTokenSecret: aws.secretsmanager.Secret
   ): aws.codebuild.ProjectArgs {
     return {
@@ -229,12 +296,12 @@ export class OrderGeneratorPipeline extends pulumi.ComponentResource {
             type: "PLAINTEXT",
             value: appName
           },
-          { 
+          {
             name: "GITHUB_TOKEN",
             type: "SECRETS_MANAGER",
             value: githubTokenSecret.name
           },
-          { 
+          {
             name: "DOCKER_USERNAME",
             type: "PLAINTEXT",
             value: dockerUsername

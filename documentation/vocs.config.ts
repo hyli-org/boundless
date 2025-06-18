@@ -48,6 +48,10 @@ const DEVELOPERS_ITEMS = [
             link: "/developers/tutorials/request",
           },
           {
+            text: "Tracking your Request",
+            link: "/developers/tutorials/tracking",
+          },
+          {
             text: "Pricing a Request",
             link: "/developers/tutorials/pricing",
           },
@@ -66,19 +70,27 @@ const DEVELOPERS_ITEMS = [
         items: [
           {
             text: "Callbacks",
-            link: "/developers/tutorials/feature-callbacks",
-          },
-          {
-            text: "Smart Contract Requestors",
-            link: "/developers/tutorials/feature-smart-contract-requestor",
-          },
-          {
-            text: "Proof Types",
-            link: "/developers/tutorials/feature-proof-types",
+            link: "/developers/tutorials/callbacks",
           },
           {
             text: "Proof Composition",
-            link: "/developers/tutorials/feature-proof-composition",
+            link: "/developers/tutorials/proof-composition",
+          },
+          {
+            text: "Proof Types",
+            link: "/developers/tutorials/proof-types",
+          },
+          {
+            text: "Migrating from Bonsai",
+            link: "/developers/tutorials/bonsai",
+          },
+          {
+            text: "Sensitive Inputs",
+            link: "/developers/tutorials/sensitive-inputs",
+          },
+          {
+            text: "Smart Contract Requestors",
+            link: "/developers/tutorials/smart-contract-requestor",
           },
         ],
       },
@@ -103,12 +115,12 @@ const DEVELOPERS_ITEMS = [
             link: "/developers/smart-contracts/reference",
           },
           {
-            text: "Verifier Contracts",
-            link: "/developers/smart-contracts/verifier-contracts",
-          },
-          {
             text: "Chains & Deployments",
             link: "/developers/smart-contracts/deployments",
+          },
+          {
+            text: "Verifier Contracts",
+            link: "/developers/smart-contracts/verifier-contracts",
           },
         ],
       },
@@ -262,8 +274,12 @@ export function generateSitemap() {
 }
 
 export default defineConfig({
+  banner: '🎉 Boundless is launching on Base for Mainnet Beta 🎉 Join the [Discord](https://discord.com/invite/boundlessxyz) and [claim the Dev role](https://guild.xyz/boundless-xyz) 🎉',
   logoUrl: "/logo.svg",
-  topNav: [{ text: "Boundless Explorer", link: "https://explorer.beboundless.xyz" }],
+  topNav: [
+    { text: "Explorer", link: "https://explorer.beboundless.xyz" },
+    { text: "Discord", link: "https://discord.gg/aXRuD6spez" }
+  ],
   font: {
     mono: {
       google: "Ubuntu Mono",

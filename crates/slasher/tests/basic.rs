@@ -6,22 +6,22 @@ use std::{process::Command, time::Duration};
 
 use alloy::{
     node_bindings::Anvil,
-    primitives::{Address, Bytes, PrimitiveSignature, U256},
+    primitives::{Address, Bytes, Signature, U256},
     providers::Provider,
     rpc::types::BlockNumberOrTag,
     signers::Signer,
 };
 use boundless_cli::OrderFulfilled;
 use boundless_market::{
-    contracts::{Input, Offer, Predicate, PredicateType, ProofRequest, RequestId, Requirements},
+    contracts::{
+        boundless_market::{FulfillmentTx, UnlockedRequest},
+        Offer, Predicate, PredicateType, ProofRequest, RequestId, RequestInput, Requirements,
+    },
     order_stream_client::Order,
 };
 use boundless_market_test_utils::create_test_ctx;
+use boundless_market_test_utils::{ASSESSOR_GUEST_ELF, ECHO_ID, ECHO_PATH, SET_BUILDER_ELF};
 use futures_util::StreamExt;
-use guest_assessor::{ASSESSOR_GUEST_ELF, ASSESSOR_GUEST_ID, ASSESSOR_GUEST_PATH};
-use guest_set_builder::{SET_BUILDER_ELF, SET_BUILDER_ID, SET_BUILDER_PATH};
-use guest_util::{ECHO_ID, ECHO_PATH};
-use risc0_ethereum_contracts::set_verifier::SetVerifierService;
 
 async fn create_order(
     signer: &impl Signer,
@@ -38,7 +38,7 @@ async fn create_order(
             Predicate { predicateType: PredicateType::PrefixMatch, data: Default::default() },
         ),
         format!("file://{ECHO_PATH}"),
-        Input::builder().build_inline().unwrap(),
+        RequestInput::builder().build_inline().unwrap(),
         Offer {
             minPrice: U256::from(0),
             maxPrice: U256::from(1),
@@ -59,15 +59,7 @@ async fn create_order(
 async fn test_basic_usage() {
     let anvil = Anvil::new().spawn();
     let rpc_url = anvil.endpoint_url();
-    let ctx = create_test_ctx(
-        &anvil,
-        SET_BUILDER_ID,
-        format!("file://{SET_BUILDER_PATH}"),
-        ASSESSOR_GUEST_ID,
-        format!("file://{ASSESSOR_GUEST_PATH}"),
-    )
-    .await
-    .unwrap();
+    let ctx = create_test_ctx(&anvil).await.unwrap();
 
     let exe_path = env!("CARGO_BIN_EXE_boundless-slasher");
     let args = [
@@ -76,7 +68,7 @@ async fn test_basic_usage() {
         "--private-key",
         &hex::encode(ctx.customer_signer.clone().to_bytes()),
         "--boundless-market-address",
-        &ctx.boundless_market_address.to_string(),
+        &ctx.deployment.boundless_market_address.to_string(),
         "--db",
         "sqlite::memory:",
         "--interval",
@@ -109,7 +101,7 @@ async fn test_basic_usage() {
         &ctx.customer_signer,
         ctx.customer_signer.address(),
         1,
-        ctx.boundless_market_address,
+        ctx.deployment.boundless_market_address,
         anvil.chain_id(),
         now,
     )
@@ -117,7 +109,7 @@ async fn test_basic_usage() {
 
     // Do the operations that should trigger the slash
     ctx.customer_market.deposit(U256::from(1)).await.unwrap();
-    ctx.prover_market.lock_request(&request, &client_sig, None).await.unwrap();
+    ctx.prover_market.lock_request(&request, client_sig.clone(), None).await.unwrap();
 
     // Wait for the slash event with timeout
     tokio::select! {
@@ -125,7 +117,7 @@ async fn test_basic_usage() {
             let request_slashed = event.unwrap().0;
             println!("Detected prover slashed for request {:?}", request_slashed.requestId);
             // Check that the stake recipient is the market treasury address
-            assert_eq!(request_slashed.stakeRecipient, ctx.boundless_market_address);
+            assert_eq!(request_slashed.stakeRecipient, ctx.deployment.boundless_market_address);
             cli_process.kill().unwrap();
         }
         _ = tokio::time::sleep(Duration::from_secs(20)) => {
@@ -139,15 +131,7 @@ async fn test_basic_usage() {
 async fn test_slash_fulfilled() {
     let anvil = Anvil::new().spawn();
     let rpc_url = anvil.endpoint_url();
-    let ctx = create_test_ctx(
-        &anvil,
-        SET_BUILDER_ID,
-        format!("file://{SET_BUILDER_PATH}"),
-        ASSESSOR_GUEST_ID,
-        format!("file://{ASSESSOR_GUEST_PATH}"),
-    )
-    .await
-    .unwrap();
+    let ctx = create_test_ctx(&anvil).await.unwrap();
 
     let exe_path = env!("CARGO_BIN_EXE_boundless-slasher");
     let args = [
@@ -156,7 +140,7 @@ async fn test_slash_fulfilled() {
         "--private-key",
         &hex::encode(ctx.customer_signer.clone().to_bytes()),
         "--boundless-market-address",
-        &ctx.boundless_market_address.to_string(),
+        &ctx.deployment.boundless_market_address.to_string(),
         "--db",
         "sqlite::memory:",
         "--interval",
@@ -189,7 +173,7 @@ async fn test_slash_fulfilled() {
         &ctx.customer_signer,
         ctx.customer_signer.address(),
         1,
-        ctx.boundless_market_address,
+        ctx.deployment.boundless_market_address,
         anvil.chain_id(),
         now,
     )
@@ -197,12 +181,12 @@ async fn test_slash_fulfilled() {
 
     // Do the operations that should trigger the slash
     ctx.customer_market.deposit(U256::from(1)).await.unwrap();
-    ctx.prover_market.lock_request(&request, &client_sig, None).await.unwrap();
+    ctx.prover_market.lock_request(&request, client_sig.clone(), None).await.unwrap();
     let domain = ctx.customer_market.eip712_domain().await.unwrap();
     let order = Order::new(
         request.clone(),
-        request.signing_hash(ctx.boundless_market_address, anvil.chain_id()).unwrap(),
-        PrimitiveSignature::try_from(client_sig.as_ref()).unwrap(),
+        request.signing_hash(ctx.deployment.boundless_market_address, anvil.chain_id()).unwrap(),
+        Signature::try_from(client_sig.as_ref()).unwrap(),
     );
     let prover = boundless_cli::DefaultProver::new(
         SET_BUILDER_ELF.to_vec(),
@@ -215,12 +199,6 @@ async fn test_slash_fulfilled() {
     let order_fulfilled = OrderFulfilled::new(fill, root_receipt, assessor_receipt).unwrap();
     let expires_at = request.offer.biddingStart + request.offer.timeout as u64;
     let lock_expires_at = request.offer.biddingStart + request.offer.lockTimeout as u64;
-    let set_verifier = SetVerifierService::new(
-        ctx.set_verifier_address,
-        ctx.customer_provider.clone(),
-        ctx.customer_signer.address(),
-    );
-    set_verifier.submit_merkle_root(order_fulfilled.root, order_fulfilled.seal).await.unwrap();
 
     // Wait for the lock to expire
     loop {
@@ -244,12 +222,14 @@ async fn test_slash_fulfilled() {
 
     // Fulfill the order
     ctx.customer_market
-        .price_and_fulfill_batch(
-            vec![request],
-            vec![client_sig],
-            order_fulfilled.fills,
-            order_fulfilled.assessorReceipt,
-            None,
+        .fulfill(
+            FulfillmentTx::new(order_fulfilled.fills, order_fulfilled.assessorReceipt)
+                .with_submit_root(
+                    ctx.deployment.set_verifier_address,
+                    order_fulfilled.root,
+                    order_fulfilled.seal,
+                )
+                .with_unlocked_request(UnlockedRequest::new(request, client_sig)),
         )
         .await
         .unwrap();

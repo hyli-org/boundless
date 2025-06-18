@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bonsai_sdk::SdkErr;
-use boundless_market::input::InputBuilder;
+use boundless_market::input::GuestEnv;
 use risc0_zkvm::Receipt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -37,28 +37,31 @@ use crate::{
 
 #[derive(Error)]
 pub enum ProverError {
-    #[error("Bonsai proving error")]
+    #[error("{code} Bonsai proving error {0:?}", code = self.code())]
     BonsaiErr(#[from] SdkErr),
 
-    #[error("Config error")]
+    #[error("{code} Config error {0}", code = self.code())]
     ConfigReadErr(#[from] ConfigErr),
 
-    #[error("Not found: {0}")]
+    #[error("{code} Not found: {0}", code = self.code())]
     NotFound(String),
 
-    #[error("Stark job missing stats data")]
+    #[error("{code} Stark job missing stats data", code = self.code())]
     MissingStatus,
 
-    #[error("Prover failure: {0}")]
+    #[error("{code} Prover failure: {0}", code = self.code())]
     ProvingFailed(String),
 
-    #[error("Bincode deserilization error")]
+    #[error("{code} Bincode deserilization error {0}", code = self.code())]
     BincodeErr(#[from] bincode::Error),
 
-    #[error("proof status expired retry count")]
+    #[error("{code} proof status expired retry count", code = self.code())]
     StatusFailure,
 
-    #[error(transparent)]
+    #[error("{code} Prover internal error: {0}", code = self.code())]
+    ProverInternalError(String),
+
+    #[error("{code} {0:?}", code = self.code())]
     UnexpectedError(#[from] anyhow::Error),
 }
 
@@ -74,6 +77,7 @@ impl CodedError for ProverError {
             ProverError::ProvingFailed(_) => "[B-BON-005]",
             ProverError::BincodeErr(_) => "[B-BON-006]",
             ProverError::StatusFailure => "[B-BON-007]",
+            ProverError::ProverInternalError(_) => "[B-BON-008]",
             ProverError::UnexpectedError(_) => "[B-BON-500]",
         }
     }
@@ -88,7 +92,7 @@ pub struct ProofResult {
 
 /// Encode inputs for Prover::upload_slice()
 pub fn encode_input(input: &impl serde::Serialize) -> Result<Vec<u8>, anyhow::Error> {
-    Ok(InputBuilder::new().write(input)?.stdin)
+    Ok(GuestEnv::builder().write(input)?.stdin)
 }
 
 #[async_trait]
@@ -119,6 +123,7 @@ pub trait Prover {
         self.wait_for_stark(&proof_id).await
     }
     async fn wait_for_stark(&self, proof_id: &str) -> Result<ProofResult, ProverError>;
+    async fn cancel_stark(&self, proof_id: &str) -> Result<(), ProverError>;
     async fn get_receipt(&self, proof_id: &str) -> Result<Option<Receipt>, ProverError>;
     async fn get_preflight_journal(&self, proof_id: &str) -> Result<Option<Vec<u8>>, ProverError>;
     async fn get_journal(&self, proof_id: &str) -> Result<Option<Vec<u8>>, ProverError>;

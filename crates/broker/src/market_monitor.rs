@@ -5,13 +5,12 @@
 use std::sync::Arc;
 
 use alloy::{
-    consensus::Transaction,
     network::Ethereum,
     primitives::{Address, U256},
     providers::Provider,
-    rpc::types::{Filter, Log},
+    rpc::types::Filter,
     sol,
-    sol_types::{SolCall, SolEvent},
+    sol_types::SolEvent,
 };
 
 use anyhow::{Context, Result};
@@ -19,16 +18,18 @@ use boundless_market::{
     contracts::{
         boundless_market::BoundlessMarketService, IBoundlessMarket, RequestId, RequestStatus,
     },
-    order_stream_client::Client as OrderStreamClient,
+    order_stream_client::OrderStreamClient,
 };
 use futures_util::StreamExt;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     chain_monitor::ChainMonitorService,
-    db::DbError,
+    db::{DbError, DbObj},
     errors::{impl_coded_debug, CodedError},
     task::{RetryRes, RetryTask, SupervisorErr},
-    DbObj, FulfillmentType, Order,
+    FulfillmentType, OrderRequest,
 };
 use thiserror::Error;
 
@@ -36,18 +37,26 @@ const BLOCK_TIME_SAMPLE_SIZE: u64 = 10;
 
 #[derive(Error)]
 pub enum MarketMonitorErr {
-    #[error("{code} Event polling failed: {0}", code = self.code())]
+    #[error("{code} Event polling failed: {0:?}", code = self.code())]
     EventPollingErr(anyhow::Error),
 
-    #[error("{code} Unexpected error: {0}", code = self.code())]
+    #[error("{code} Log processing failed: {0:?}", code = self.code())]
+    LogProcessingFailed(anyhow::Error),
+
+    #[error("{code} Unexpected error: {0:?}", code = self.code())]
     UnexpectedErr(#[from] anyhow::Error),
+
+    #[error("{code} Receiver dropped", code = self.code())]
+    ReceiverDropped,
 }
 
 impl CodedError for MarketMonitorErr {
     fn code(&self) -> &str {
         match self {
             MarketMonitorErr::EventPollingErr(_) => "[B-MM-501]",
+            MarketMonitorErr::LogProcessingFailed(_) => "[B-MM-502]",
             MarketMonitorErr::UnexpectedErr(_) => "[B-MM-500]",
+            MarketMonitorErr::ReceiverDropped => "[B-MM-502]",
         }
     }
 }
@@ -62,6 +71,7 @@ pub struct MarketMonitor<P> {
     chain_monitor: Arc<ChainMonitorService<P>>,
     prover_addr: Address,
     order_stream: Option<OrderStreamClient>,
+    new_order_tx: tokio::sync::mpsc::Sender<Box<OrderRequest>>,
 }
 
 sol! {
@@ -77,6 +87,7 @@ impl<P> MarketMonitor<P>
 where
     P: Provider<Ethereum> + 'static + Clone,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         lookback_blocks: u64,
         market_addr: Address,
@@ -85,6 +96,7 @@ where
         chain_monitor: Arc<ChainMonitorService<P>>,
         prover_addr: Address,
         order_stream: Option<OrderStreamClient>,
+        new_order_tx: tokio::sync::mpsc::Sender<Box<OrderRequest>>,
     ) -> Self {
         Self {
             lookback_blocks,
@@ -94,6 +106,7 @@ where
             chain_monitor,
             prover_addr,
             order_stream,
+            new_order_tx,
         }
     }
 
@@ -125,8 +138,8 @@ where
         lookback_blocks: u64,
         market_addr: Address,
         provider: Arc<P>,
-        db: DbObj,
         chain_monitor: Arc<ChainMonitorService<P>>,
+        new_order_tx: &tokio::sync::mpsc::Sender<Box<OrderRequest>>,
     ) -> Result<u64, MarketMonitorErr> {
         let current_block = chain_monitor.current_block_number().await?;
         let chain_id = provider.get_chain_id().await.context("Failed to get chain id")?;
@@ -167,28 +180,9 @@ where
         for log in decoded_logs {
             let event = &log.inner.data;
             let request_id = U256::from(event.requestId);
-            let tx_hash = log.transaction_hash.context("Missing transaction hash")?;
-            let tx_data = provider
-                .get_transaction_by_hash(tx_hash)
-                .await
-                .context("Failed to get transaction by hash")?
-                .context("Missing transaction data")?;
-            let calldata = IBoundlessMarket::submitRequestCall::abi_decode(tx_data.input(), true)
-                .context("Failed to decode calldata")?;
-            let order_exists = match db.order_exists_with_request_id(request_id).await {
-                Ok(val) => val,
-                Err(err) => {
-                    tracing::error!("Failed to check if order exists in db: {err:?}");
-                    continue;
-                }
-            };
-            // TODO(#162) Handle the case where multiple requests share an ID.
-            if order_exists {
-                continue;
-            }
 
             let req_status =
-                match market.get_status(request_id, Some(calldata.request.expires_at())).await {
+                match market.get_status(request_id, Some(event.request.expires_at())).await {
                     Ok(val) => val,
                     Err(err) => {
                         tracing::warn!("Failed to get request status: {err:?}");
@@ -199,7 +193,7 @@ where
             if !matches!(req_status, RequestStatus::Unknown) {
                 tracing::debug!(
                     "Skipping order {} reason: order status no longer bidding: {:?}",
-                    calldata.request.id,
+                    request_id,
                     req_status
                 );
                 continue;
@@ -211,24 +205,24 @@ where
             };
 
             tracing::info!(
-                "Found open order: {:x} with request status: {:?}, adding to database with fulfillment type: {:?}",
-                calldata.request.id,
+                "Found open order: {:x} with request status: {:?}, preparing to process with fulfillment type: {:?}",
+                request_id,
                 req_status,
                 fulfillment_type
             );
-            if let Err(err) = db
-                .add_order(Order::new(
-                    calldata.request.clone(),
-                    calldata.clientSignature.clone(),
-                    fulfillment_type,
-                    market_addr,
-                    chain_id,
-                ))
+
+            let new_order = OrderRequest::new(
+                event.request.clone(),
+                event.clientSignature.clone(),
+                fulfillment_type,
+                market_addr,
+                chain_id,
+            );
+
+            new_order_tx
+                .send(Box::new(new_order))
                 .await
-            {
-                tracing::error!("Failed to insert order in to database: {err:?}");
-                continue;
-            }
+                .map_err(|_| MarketMonitorErr::ReceiverDropped)?;
             order_count += 1;
         }
 
@@ -240,7 +234,8 @@ where
     async fn monitor_orders(
         market_addr: Address,
         provider: Arc<P>,
-        db: DbObj,
+        new_order_tx: mpsc::Sender<Box<OrderRequest>>,
+        cancel_token: CancellationToken,
     ) -> Result<(), MarketMonitorErr> {
         let chain_id = provider.get_chain_id().await.context("Failed to get chain id")?;
 
@@ -256,34 +251,42 @@ where
             .await
             .context("Failed to subscribe to RequestSubmitted event")?;
         tracing::info!("Subscribed to RequestSubmitted event");
-        event
-            .into_stream()
-            .for_each(|log_res| async {
-                match log_res {
-                    Ok((event, log)) => {
-                        if let Err(err) = Self::process_log(
-                            event,
-                            log,
-                            provider.clone(),
-                            market_addr,
-                            chain_id,
-                            &db,
-                        )
-                        .await
-                        {
-                            tracing::error!("Failed to process event log: {err:?}");
+
+        let mut stream = event.into_stream();
+        loop {
+            tokio::select! {
+                log_res = stream.next() => {
+                    match log_res {
+                        Some(Ok((event, _))) => {
+                            if let Err(err) = Self::process_event(
+                                event,
+                                provider.clone(),
+                                market_addr,
+                                chain_id,
+                                &new_order_tx,
+                            )
+                            .await
+                            {
+                                let event_err = MarketMonitorErr::LogProcessingFailed(err);
+                                tracing::error!("Failed to process event log: {event_err:?}");
+                            }
+                        }
+                        Some(Err(err)) => {
+                            let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
+                            tracing::warn!("Failed to fetch event log: {event_err:?}");
+                        }
+                        None => {
+                            return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
+                                "Event polling exited, polling failed (possible RPC error)"
+                            )));
                         }
                     }
-                    Err(err) => {
-                        tracing::warn!("Failed to fetch event log: {:?}", err);
-                    }
                 }
-            })
-            .await;
-
-        Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
-            "Event polling exited, polling failed (possible RPC error)"
-        )))
+                _ = cancel_token.cancelled() => {
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// Monitors the RequestLocked events and updates the database accordingly.
@@ -292,7 +295,9 @@ where
         prover_addr: Address,
         provider: Arc<P>,
         db: DbObj,
+        new_order_tx: mpsc::Sender<Box<OrderRequest>>,
         order_stream: Option<OrderStreamClient>,
+        cancel_token: CancellationToken,
     ) -> Result<(), MarketMonitorErr> {
         let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
         let chain_id = provider.get_chain_id().await.context("Failed to get chain id")?;
@@ -304,89 +309,88 @@ where
             .context("Failed to subscribe to RequestLocked event")?;
         tracing::info!("Subscribed to RequestLocked event");
 
-        event
-            .into_stream()
-            .for_each(|log_res| async {
-                match log_res {
-                    Ok((event, log)) => {
-                        tracing::debug!(
-                            "Detected request {:x} locked by {:x}",
-                            event.requestId,
-                            event.prover,
-                        );
-                        if let Err(e) = db
-                            .set_request_locked(
-                                U256::from(event.requestId),
-                                &event.prover.to_string(),
-                                log.block_number.unwrap(),
-                            )
-                            .await
-                        {
-                            match e {
-                                DbError::SqlUniqueViolation(_) => {
-                                    tracing::warn!("Duplicate request locked detected {:x}: {e:?}", event.requestId);
-                                }
-                                _ => {
-                                    tracing::error!("Failed to store request locked for request {:x} in db: {e:?}", event.requestId);
+        let mut stream = event.into_stream();
+        loop {
+            tokio::select! {
+                log_res = stream.next() => {
+                    match log_res {
+                        Some(Ok((event, log))) => {
+                            tracing::debug!(
+                                "Detected request 0x{:x} locked by {:x}",
+                                event.requestId,
+                                event.prover,
+                            );
+                            if let Err(e) = db
+                                .set_request_locked(
+                                    U256::from(event.requestId),
+                                    &event.prover.to_string(),
+                                    log.block_number.unwrap(),
+                                )
+                                .await
+                            {
+                                match e {
+                                    DbError::SqlUniqueViolation(_) => {
+                                        tracing::warn!("Duplicate request locked detected {:x}: {e:?}", event.requestId);
+                                    }
+                                    _ => {
+                                        tracing::error!("Failed to store request locked for request {:x} in db: {e:?}", event.requestId);
+                                    }
                                 }
                             }
-                        }
 
-                        // If the request was not locked by the prover, we create an order to evaluate the request
-                        // for fulfilling after the lock expires.
-                        if event.prover != prover_addr {
-                            // Try to get from market first. If the request was submitted via the order stream, we will be unable to find it there.
-                            // In that case we check the order stream.
-                            let mut order: Option<Order> = None;
-                            if let Ok((proof_request, signature)) = market.get_submitted_request(event.requestId, None).await {
-                                order = Some(Order::new(
-                                    proof_request,
-                                    signature,
-                                    FulfillmentType::FulfillAfterLockExpire,
-                                    market_addr,
-                                    chain_id,
-                                ));
-                            } else if let Some(order_stream) = &order_stream {
-                                if let Ok(order_stream_order) = order_stream.fetch_order(event.requestId, None).await {
-                                    let proof_request = order_stream_order.request;
-                                    let signature = order_stream_order.signature;
-                                    order = Some(Order::new(
+                            // If the request was not locked by the prover, we create an order to evaluate the request
+                            // for fulfilling after the lock expires.
+                            if event.prover != prover_addr {
+                                // Try to get from market first. If the request was submitted via the order stream, we will be unable to find it there.
+                                // In that case we check the order stream.
+                                let mut order: Option<OrderRequest> = None;
+                                if let Ok((proof_request, signature)) = market.get_submitted_request(event.requestId, None).await {
+                                    order = Some(OrderRequest::new(
                                         proof_request,
-                                        signature.as_bytes().into(),
+                                        signature,
                                         FulfillmentType::FulfillAfterLockExpire,
                                         market_addr,
                                         chain_id,
                                     ));
+                                } else if let Some(order_stream) = &order_stream {
+                                    if let Ok(order_stream_order) = order_stream.fetch_order(event.requestId, None).await {
+                                        let proof_request = order_stream_order.request;
+                                        let signature = order_stream_order.signature;
+                                        order = Some(OrderRequest::new(
+                                            proof_request,
+                                            signature.as_bytes().into(),
+                                            FulfillmentType::FulfillAfterLockExpire,
+                                            market_addr,
+                                            chain_id,
+                                        ));
+                                    }
+                                }
+
+                                if let Some(order) = order {
+                                    if let Err(e) = new_order_tx.send(Box::new(order)).await {
+                                        tracing::error!("Failed to send order locked by another prover, {:x}: {e:?}", event.requestId);
+                                    }
+                                } else {
+                                    tracing::warn!("Failed to get order from market or order stream for locked request {:x}. Unable to evaluate for fulfillment after lock expires.", event.requestId);
                                 }
                             }
-
-                            if order.is_none() {
-                                tracing::warn!("Failed to get order from market or order stream for locked request {:x}. Unable to evaluate for fulfillment after lock expires.", event.requestId);
-                                return;
-                            }
-
-                            let order = order.unwrap();
-                            if let Err(e) = db.add_order(order.clone()).await {
-                                tracing::error!("Failed to add order {} to database with fulfillment type: {:?}: {e:?}", order.id(), FulfillmentType::FulfillAfterLockExpire);
-                            } else {
-                                tracing::info!(
-                                    "Added order {:x} to database with fulfillment type: {:?}",
-                                    event.requestId,
-                                    FulfillmentType::FulfillAfterLockExpire
-                                );
-                            }
+                        }
+                        Some(Err(err)) => {
+                            let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
+                            tracing::warn!("Failed to fetch RequestLocked event log: {event_err:?}");
+                        }
+                        None => {
+                            return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
+                                "Event polling exited, polling failed (possible RPC error)",
+                            )));
                         }
                     }
-                    Err(err) => {
-                        tracing::warn!("Failed to fetch RequestLocked event log: {:?}", err);
-                    }
                 }
-            })
-            .await;
-
-        Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
-            "Event polling exited, polling failed (possible RPC error)",
-        )))
+                _ = cancel_token.cancelled() => {
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// Monitors the RequestFulfilled events and updates the database accordingly.
@@ -394,6 +398,7 @@ where
         market_addr: Address,
         provider: Arc<P>,
         db: DbObj,
+        cancel_token: CancellationToken,
     ) -> Result<(), MarketMonitorErr> {
         let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
         let event = market
@@ -404,122 +409,105 @@ where
             .context("Failed to subscribe to RequestFulfilled event")?;
         tracing::info!("Subscribed to RequestFulfilled event");
 
-        event
-            .into_stream()
-            .for_each(|log_res| async {
-                match log_res {
-                    Ok((event, log)) => {
-                        tracing::debug!("Detected request fulfilled {:x}", event.requestId);
-                        if let Err(e) = db
-                            .set_request_fulfilled(
-                                U256::from(event.requestId),
-                                log.block_number.unwrap(),
-                            )
-                            .await
-                        {
-                            match e {
-                                DbError::SqlUniqueViolation(_) => {
-                                    tracing::warn!("Duplicate fulfillment event detected: {e:?}");
-                                }
-                                _ => {
-                                    tracing::error!(
-                                        "Failed to store fulfillment for request id {:x}: {e:?}",
-                                        event.requestId
-                                    );
+        let mut stream = event.into_stream();
+        loop {
+            tokio::select! {
+                log_res = stream.next() => {
+                    match log_res {
+                        Some(Ok((event, log))) => {
+                            tracing::debug!("Detected request fulfilled 0x{:x}", event.requestId);
+                            if let Err(e) = db
+                                .set_request_fulfilled(
+                                    U256::from(event.requestId),
+                                    log.block_number.unwrap(),
+                                )
+                                .await
+                            {
+                                match e {
+                                    DbError::SqlUniqueViolation(_) => {
+                                        tracing::warn!("Duplicate fulfillment event detected: {e:?}");
+                                    }
+                                    _ => {
+                                        tracing::error!(
+                                            "Failed to store fulfillment for request id {:x}: {e:?}",
+                                            event.requestId
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(err) => {
-                        tracing::warn!("Failed to fetch RequestFulfilled event log: {:?}", err);
+                        Some(Err(err)) => {
+                            let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
+                            tracing::warn!("Failed to fetch RequestFulfilled event log: {event_err:?}");
+                        }
+                        None => {
+                            return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
+                                "Event polling order fulfillments exited, polling failed (possible RPC error)",
+                            )));
+                        }
                     }
                 }
-            })
-            .await;
-
-        Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
-            "Event polling order fulfillments exited, polling failed (possible RPC error)",
-        )))
+                _ = cancel_token.cancelled() => {
+                    return Ok(());
+                }
+            }
+        }
     }
 
-    async fn process_log(
+    async fn process_event(
         event: IBoundlessMarket::RequestSubmitted,
-        log: Log,
         provider: Arc<P>,
         market_addr: Address,
         chain_id: u64,
-        db: &DbObj,
+        new_order_tx: &tokio::sync::mpsc::Sender<Box<OrderRequest>>,
     ) -> Result<()> {
-        tracing::info!("Detected new request {:x}", event.requestId);
-
-        let tx_hash = log.transaction_hash.context("Missing transaction hash")?;
-        let tx_data =
-            provider.get_transaction_by_hash(tx_hash).await?.context("Missing transaction data")?;
-
-        let calldata = IBoundlessMarket::submitRequestCall::abi_decode(tx_data.input(), true)
-            .context("Failed to decode calldata")?;
-
+        tracing::info!("Detected new on-chain request 0x{:x}", event.requestId);
         // Check the request id flag to determine if the request is smart contract signed. If so we verify the
         // ERC1271 signature by calling isValidSignature on the smart contract client. Otherwise we verify the
         // the signature as an ECDSA signature.
-        let request_id = RequestId::from_lossy(calldata.request.id);
+        let request_id = RequestId::from_lossy(event.requestId);
         if request_id.smart_contract_signed {
             let erc1271 = IERC1271::new(request_id.addr, provider);
-            let request_hash = calldata.request.signing_hash(market_addr, chain_id)?;
+            let request_hash = event.request.signing_hash(market_addr, chain_id)?;
             tracing::debug!(
                 "Validating ERC1271 signature for request 0x{:x}, calling contract: {} with hash {:x}",
-                calldata.request.id,
+                event.requestId,
                 request_id.addr,
                 request_hash
             );
-            match erc1271
-                .isValidSignature(request_hash, calldata.clientSignature.clone())
-                .call()
-                .await
+            match erc1271.isValidSignature(request_hash, event.clientSignature.clone()).call().await
             {
-                Ok(res) => {
-                    let magic_value = res.magicValue;
+                Ok(magic_value) => {
                     if magic_value != ERC1271_MAGIC_VALUE {
-                        tracing::warn!("Invalid ERC1271 signature for request 0x{:x}, contract: {} returned magic value: 0x{:x}", calldata.request.id, request_id.addr, magic_value);
+                        tracing::warn!("Invalid ERC1271 signature for request 0x{:x}, contract: {} returned magic value: 0x{:x}", event.requestId, request_id.addr, magic_value);
                         return Ok(());
                     }
                 }
                 Err(err) => {
-                    tracing::warn!("Failed to call ERC1271 isValidSignature for request 0x{:x}, contract: {} - {err:?}", calldata.request.id, request_id.addr);
+                    tracing::warn!("Failed to call ERC1271 isValidSignature for request 0x{:x}, contract: {} - {err:?}", event.requestId, request_id.addr);
                     return Ok(());
                 }
             }
         } else if let Err(err) =
-            calldata.request.verify_signature(&calldata.clientSignature, market_addr, chain_id)
+            event.request.verify_signature(&event.clientSignature, market_addr, chain_id)
         {
-            tracing::warn!(
-                "Failed to validate order signature: 0x{:x} - {err:?}",
-                calldata.request.id
-            );
+            tracing::warn!("Failed to validate order signature: 0x{:x} - {err:?}", event.requestId);
             return Ok(()); // Return early without propagating the error if signature verification fails.
         }
 
-        if let Err(err) = db
-            .add_order(Order::new(
-                calldata.request.clone(),
-                calldata.clientSignature.clone(),
-                FulfillmentType::LockAndFulfill,
-                market_addr,
-                chain_id,
-            ))
-            .await
-        {
-            match err {
-                DbError::SqlUniqueViolation(_) => {
-                    tracing::warn!("Duplicate order detected {:x}: {err:?}", calldata.request.id);
-                }
-                _ => {
-                    tracing::error!(
-                        "Failed to add new order into DB {:x}: {err:?}",
-                        calldata.request.id
-                    );
-                }
-            }
+        let new_order = OrderRequest::new(
+            event.request.clone(),
+            event.clientSignature.clone(),
+            FulfillmentType::LockAndFulfill,
+            market_addr,
+            chain_id,
+        );
+
+        let order_id = new_order.id();
+        if let Err(e) = new_order_tx.send(Box::new(new_order)).await {
+            tracing::error!("Failed to send new on-chain order {} to OrderPicker: {}", order_id, e);
+        } else {
+            tracing::trace!("Sent new on-chain order {} to OrderPicker via channel.", order_id);
         }
         Ok(())
     }
@@ -530,14 +518,15 @@ where
     P: Provider<Ethereum> + 'static + Clone,
 {
     type Error = MarketMonitorErr;
-    fn spawn(&self) -> RetryRes<Self::Error> {
+    fn spawn(&self, cancel_token: CancellationToken) -> RetryRes<Self::Error> {
         let lookback_blocks = self.lookback_blocks;
         let market_addr = self.market_addr;
         let provider = self.provider.clone();
-        let db = self.db.clone();
-        let chain_monitor = self.chain_monitor.clone();
-        let order_stream = self.order_stream.clone();
         let prover_addr = self.prover_addr;
+        let chain_monitor = self.chain_monitor.clone();
+        let new_order_tx = self.new_order_tx.clone();
+        let db = self.db.clone();
+        let order_stream = self.order_stream.clone();
 
         Box::pin(async move {
             tracing::info!("Starting up market monitor");
@@ -546,8 +535,8 @@ where
                 lookback_blocks,
                 market_addr,
                 provider.clone(),
-                db.clone(),
                 chain_monitor,
+                &new_order_tx,
             )
             .await
             .map_err(|err| {
@@ -555,20 +544,32 @@ where
                 SupervisorErr::Recover(err)
             })?;
 
-            tokio::select! {
-                Err(err) = Self::monitor_orders(market_addr, provider.clone(), db.clone()) => {
-                    tracing::warn!("Monitor for new orders failed, restarting.");
-                    Err(SupervisorErr::Recover(err))
-                }
-                Err(err) = Self::monitor_order_fulfillments(market_addr, provider.clone(), db.clone()) => {
-                    tracing::warn!("Monitor for order fulfillments failed, restarting.");
-                    Err(SupervisorErr::Recover(err))
-                }
-                Err(err) = Self::monitor_order_locks(market_addr, prover_addr, provider.clone(), db.clone(), order_stream.clone()) => {
-                    tracing::warn!("Monitor for order locks failed, restarting.");
-                    Err(SupervisorErr::Recover(err))
-                }
-            }
+            tokio::try_join!(
+                Self::monitor_orders(
+                    market_addr,
+                    provider.clone(),
+                    new_order_tx.clone(),
+                    cancel_token.clone()
+                ),
+                Self::monitor_order_fulfillments(
+                    market_addr,
+                    provider.clone(),
+                    db.clone(),
+                    cancel_token.clone()
+                ),
+                Self::monitor_order_locks(
+                    market_addr,
+                    prover_addr,
+                    provider.clone(),
+                    db,
+                    new_order_tx,
+                    order_stream,
+                    cancel_token
+                )
+            )
+            .map_err(SupervisorErr::Recover)?;
+
+            Ok(())
         })
     }
 }
@@ -587,18 +588,17 @@ mod tests {
     };
     use boundless_market::{
         contracts::{
-            boundless_market::BoundlessMarketService, hit_points::default_allowance,
-            AssessorReceipt, Input, InputType, Offer, Predicate, PredicateType, ProofRequest,
-            Requirements,
+            boundless_market::{BoundlessMarketService, FulfillmentTx},
+            hit_points::default_allowance,
+            AssessorReceipt, Offer, Predicate, PredicateType, ProofRequest, RequestInput,
+            RequestInputType, Requirements,
         },
-        input::InputBuilder,
+        input::GuestEnv,
     };
     use boundless_market_test_utils::{
-        create_test_ctx, deploy_boundless_market, mock_singleton, TestCtx,
+        create_test_ctx, deploy_boundless_market, mock_singleton, TestCtx, ASSESSOR_GUEST_ID,
+        ASSESSOR_GUEST_PATH, ECHO_ID,
     };
-    use guest_assessor::{ASSESSOR_GUEST_ID, ASSESSOR_GUEST_PATH};
-    use guest_set_builder::{SET_BUILDER_ID, SET_BUILDER_PATH};
-    use guest_util::ECHO_ID;
     use risc0_zkvm::sha::Digest;
 
     #[tokio::test]
@@ -639,7 +639,7 @@ mod tests {
                 Predicate { predicateType: PredicateType::PrefixMatch, data: Default::default() },
             ),
             imageUrl: "test".to_string(),
-            input: Input { inputType: InputType::Url, data: Default::default() },
+            input: RequestInput { inputType: RequestInputType::Url, data: Default::default() },
             offer: Offer {
                 minPrice: U256::from(min_price),
                 maxPrice: U256::from(max_price),
@@ -659,14 +659,17 @@ mod tests {
         // tx_receipt.inner.logs().into_iter().map(|log| Ok((decode_log(&log)?, log))).collect()
 
         let chain_monitor = Arc::new(ChainMonitorService::new(provider.clone()).await.unwrap());
-        tokio::spawn(chain_monitor.spawn());
+        tokio::spawn(chain_monitor.spawn(Default::default()));
 
-        let db: DbObj = Arc::new(SqliteDb::new("sqlite::memory:").await.unwrap());
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
         let orders =
-            MarketMonitor::find_open_orders(2, market_address, provider, db, chain_monitor)
+            MarketMonitor::find_open_orders(2, market_address, provider, chain_monitor, &order_tx)
                 .await
                 .unwrap();
         assert_eq!(orders, 1);
+
+        order_rx.try_recv().unwrap();
+        assert!(order_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -684,10 +687,19 @@ mod tests {
         provider.anvil_mine(Some(10), Some(2)).await.unwrap();
 
         let chain_monitor = Arc::new(ChainMonitorService::new(provider.clone()).await.unwrap());
-        tokio::spawn(chain_monitor.spawn());
+        tokio::spawn(chain_monitor.spawn(Default::default()));
+        let (order_tx, _order_rx) = tokio::sync::mpsc::channel(16);
         let db: DbObj = Arc::new(SqliteDb::new("sqlite::memory:").await.unwrap());
-        let market_monitor =
-            MarketMonitor::new(1, Address::ZERO, provider, db, chain_monitor, Address::ZERO, None);
+        let market_monitor = MarketMonitor::new(
+            1,
+            Address::ZERO,
+            provider,
+            db,
+            chain_monitor,
+            Address::ZERO,
+            None,
+            order_tx,
+        );
 
         let block_time = market_monitor.get_block_time().await.unwrap();
         assert_eq!(block_time, 2);
@@ -699,15 +711,7 @@ mod tests {
         // Setup anvil
         let anvil = Anvil::new().spawn();
 
-        let ctx = create_test_ctx(
-            &anvil,
-            SET_BUILDER_ID,
-            format!("file://{SET_BUILDER_PATH}"),
-            ASSESSOR_GUEST_ID,
-            format!("file://{ASSESSOR_GUEST_PATH}"),
-        )
-        .await
-        .unwrap();
+        let ctx = create_test_ctx(&anvil).await.unwrap();
 
         let eip712_domain = eip712_domain! {
             name: "IBoundlessMarket",
@@ -725,28 +729,16 @@ mod tests {
         // fetch logs to retrieve the customer signature from the event
         let logs = ctx.customer_market.instance().RequestSubmitted_filter().query().await.unwrap();
 
-        let (_, log) = logs.first().unwrap();
-        let tx_hash = log.transaction_hash.unwrap();
-        let tx_data = ctx
-            .customer_market
-            .instance()
-            .provider()
-            .get_transaction_by_hash(tx_hash)
-            .await
-            .unwrap()
-            .unwrap();
-        let inputs = tx_data.input();
-        let calldata = IBoundlessMarket::submitRequestCall::abi_decode(inputs, true).unwrap();
-
-        let request = calldata.request;
-        let customer_sig = calldata.clientSignature;
+        let (event, _) = logs.first().unwrap();
+        let request = &event.request;
+        let customer_sig = event.clientSignature.clone();
 
         // Deposit prover balances
         let deposit = default_allowance();
         ctx.prover_market.deposit_stake_with_permit(deposit, &ctx.prover_signer).await.unwrap();
 
         // Lock the request
-        ctx.prover_market.lock_request(&request, &customer_sig, None).await.unwrap();
+        ctx.prover_market.lock_request(request, customer_sig, None).await.unwrap();
         assert!(ctx.customer_market.is_locked(request_id).await.unwrap());
         assert!(
             ctx.customer_market.get_status(request_id, Some(expires_at)).await.unwrap()
@@ -755,7 +747,7 @@ mod tests {
 
         // mock the fulfillment
         let (root, set_verifier_seal, fulfillment, assessor_seal) =
-            mock_singleton(&request, eip712_domain, ctx.prover_signer.address());
+            mock_singleton(request, eip712_domain, ctx.prover_signer.address());
 
         // publish the committed root
         ctx.set_verifier.submit_merkle_root(root, set_verifier_seal).await.unwrap();
@@ -767,7 +759,10 @@ mod tests {
             callbacks: vec![],
         };
         // fulfill the request
-        ctx.prover_market.fulfill(&fulfillment, assessor_fill).await.unwrap();
+        ctx.prover_market
+            .fulfill(FulfillmentTx::new(vec![fulfillment.clone()], assessor_fill.clone()))
+            .await
+            .unwrap();
         assert!(ctx.customer_market.is_fulfilled(request_id).await.unwrap());
 
         // retrieve journal and seal from the fulfilled request
@@ -786,7 +781,7 @@ mod tests {
                 Predicate { predicateType: PredicateType::PrefixMatch, data: Default::default() },
             ),
             "http://image_uri.null",
-            InputBuilder::new().build_inline().unwrap(),
+            GuestEnv::builder().build_inline().unwrap(),
             Offer {
                 minPrice: U256::from(20000000000000u64),
                 maxPrice: U256::from(40000000000000u64),

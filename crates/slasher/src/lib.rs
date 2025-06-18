@@ -5,26 +5,20 @@
 use std::{cmp::min, sync::Arc};
 
 use alloy::{
-    consensus::Transaction,
-    network::{Ethereum, EthereumWallet, TransactionResponse},
+    network::{Ethereum, EthereumWallet},
     primitives::{Address, U256},
     providers::{
-        fillers::{
-            BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
-            WalletFiller,
-        },
+        fillers::{ChainIdFiller, JoinFill},
         Identity, Provider, ProviderBuilder, RootProvider,
     },
     signers::local::PrivateKeySigner,
-    sol_types::SolCall,
     transports::{RpcError, TransportErrorKind},
 };
 use boundless_market::{
     balance_alerts_layer::{BalanceAlertConfig, BalanceAlertLayer, BalanceAlertProvider},
-    contracts::{
-        boundless_market::{BoundlessMarketService, MarketError},
-        IBoundlessMarket::{self},
-    },
+    contracts::boundless_market::{BoundlessMarketService, MarketError},
+    dynamic_gas_filler::DynamicGasFiller,
+    nonce_layer::NonceProvider,
 };
 use db::{DbError, DbObj, SqliteDb};
 use thiserror::Error;
@@ -33,14 +27,8 @@ use url::Url;
 
 mod db;
 
-type ProviderWallet = FillProvider<
-    JoinFill<
-        JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-        >,
-        WalletFiller<EthereumWallet>,
-    >,
+type ProviderWallet = NonceProvider<
+    JoinFill<JoinFill<Identity, ChainIdFiller>, DynamicGasFiller>,
     BalanceAlertProvider<RootProvider>,
 >;
 
@@ -91,6 +79,7 @@ pub struct SlashServiceConfig {
     pub balance_warn_threshold: Option<U256>,
     pub balance_error_threshold: Option<U256>,
     pub skip_addresses: Vec<Address>,
+    pub tx_timeout: Duration,
 }
 
 impl SlashService<ProviderWallet> {
@@ -104,19 +93,25 @@ impl SlashService<ProviderWallet> {
         let caller = private_key.address();
         let wallet = EthereumWallet::from(private_key.clone());
 
+        let signer_address = wallet.default_signer().address();
         let balance_alerts_layer = BalanceAlertLayer::new(BalanceAlertConfig {
-            watch_address: wallet.default_signer().address(),
+            watch_address: signer_address,
             warn_threshold: config.balance_warn_threshold,
             error_threshold: config.balance_error_threshold,
         });
 
-        let provider = ProviderBuilder::new()
+        let dynamic_gas_filler = DynamicGasFiller::new(0.2, 0.05, 2.0, signer_address);
+        let base_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .filler(ChainIdFiller::default())
+            .filler(dynamic_gas_filler)
             .layer(balance_alerts_layer)
-            .wallet(wallet.clone())
-            .on_http(rpc_url);
+            .connect_http(rpc_url);
+        let provider = NonceProvider::new(base_provider, wallet.clone());
 
         let boundless_market =
-            BoundlessMarketService::new(boundless_market_address, provider.clone(), caller);
+            BoundlessMarketService::new(boundless_market_address, provider.clone(), caller)
+                .with_timeout(config.tx_timeout);
 
         let db: DbObj = Arc::new(SqliteDb::new(db_conn).await.unwrap());
 
@@ -246,43 +241,31 @@ where
             to_block
         );
 
-        for (log, log_data) in logs {
-            // TODO(willpote): Remove, or make more resilient.
-            // Note this logic is not full proof. It will not handle lockRequestWithSignature
-            // nor if the lockRequest calls were for example, made via a proxy contract.
-            // This is a temporary solution to avoid slashing requests from the team's broker.
-            let tx_hash = log_data.transaction_hash.unwrap();
-            let tx = self
-                .boundless_market
-                .instance()
-                .provider()
-                .get_transaction_by_hash(tx_hash)
-                .await?
-                .unwrap();
-
-            let sender = tx.from();
+        for (event, log_data) in logs {
+            let prover = event.prover;
 
             // Skip if sender is in the skip list
-            if self.config.skip_addresses.contains(&sender) {
+            if self.config.skip_addresses.contains(&prover) {
                 tracing::info!(
-                    "Skipping locked event from sender: {:?} for request: 0x{:x}",
-                    sender,
-                    log.requestId
+                    "Skipping locked event from prover: {:?} for request: 0x{:x}",
+                    prover,
+                    event.requestId
                 );
                 continue;
             }
 
             tracing::debug!(
-                "Processing locked event from sender: {:?} for request: 0x{:x}",
-                sender,
-                log.requestId
+                "Processing locked event from prover: {:?} for request: 0x{:x} found at block {:?}",
+                prover,
+                event.requestId,
+                log_data.block_number
             );
 
-            let request = IBoundlessMarket::lockRequestCall::abi_decode(tx.input(), true)?.request;
+            let request = event.request.clone();
             let expires_at = request.expires_at();
             let lock_expires_at = request.offer.biddingStart + request.offer.lockTimeout as u64;
 
-            self.add_order(log.requestId, expires_at, lock_expires_at).await?;
+            self.add_order(event.requestId, expires_at, lock_expires_at).await?;
         }
 
         Ok(())
@@ -309,7 +292,12 @@ where
             to_block
         );
 
-        for (log, _) in logs {
+        for (log, log_data) in logs {
+            tracing::debug!(
+                "Processing slashed event for request: 0x{:x} found at block {}",
+                log.requestId,
+                log_data.block_number.unwrap_or(0)
+            );
             self.remove_order(log.requestId).await?;
         }
 
@@ -337,16 +325,39 @@ where
             to_block
         );
 
-        for (log, data) in logs {
-            let current_ts = if let Some(current_ts) = data.block_timestamp {
+        for (log, log_data) in logs {
+            tracing::debug!(
+                "Processing fulfilled event for request: 0x{:x} found at block {}",
+                log.requestId,
+                log_data.block_number.unwrap_or(0)
+            );
+            let current_ts = if let Some(current_ts) = log_data.block_timestamp {
                 current_ts
             } else {
-                let bn = data.block_number.ok_or(ServiceError::BlockNumberNotFound)?;
+                let bn = log_data.block_number.ok_or(ServiceError::BlockNumberNotFound)?;
                 self.block_timestamp(bn).await?
             };
-            let (_, lock_expires_at) = self.db.get_order(log.requestId).await?;
+            let (_, lock_expires_at) = match self.db.get_order(log.requestId).await? {
+                Some(order_data) => order_data,
+                None => {
+                    tracing::warn!(
+                        "Order not found in database for fulfilled request: 0x{:x}, skipping",
+                        log.requestId
+                    );
+                    continue;
+                }
+            };
             if current_ts <= lock_expires_at {
+                tracing::debug!(
+                    "Request was fulfilled before lock expired. Removing from db: 0x{:x}",
+                    log.requestId
+                );
                 self.remove_order(log.requestId).await?;
+            } else {
+                tracing::debug!(
+                    "Request was fulfilled after lock expired. Not removing from db: 0x{:x}",
+                    log.requestId
+                );
             }
         }
 
@@ -376,6 +387,7 @@ where
             self.db.get_expired_orders(self.block_timestamp(current_block).await?).await?;
 
         for request_id in expired {
+            tracing::debug!("About to slash expired request: 0x{:x}", request_id);
             match self.boundless_market.slash(request_id).await {
                 Ok(_) => {
                     tracing::info!("Slashing successful for request 0x{:x}", request_id);
@@ -387,7 +399,7 @@ where
                         || err_msg.contains("RequestIsFulfilled")
                     {
                         tracing::warn!(
-                            "Request already processed, removing 0x{:x}, reason: {}",
+                            "Request was either fulfilled before lock expiry, or has already been slashed, removing 0x{:x}, reason: {}",
                             request_id,
                             err_msg
                         );
@@ -407,7 +419,7 @@ where
                         return Err(ServiceError::InsufficientFunds(err_msg));
                     } else {
                         // Any other error should be RPC related so we can retry
-                        tracing::error!("Failed to slash request 0x{:x}", request_id);
+                        tracing::error!("Failed to slash request 0x{:x}: {}", request_id, err);
                         return Err(ServiceError::BoundlessMarketError(err));
                     }
                 }
